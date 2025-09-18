@@ -1,6 +1,6 @@
 import { chromium } from 'playwright';
 
-const DEBUG = process.env.DEBUG?.toString() === '1';
+const DEBUG = (process.env.DEBUG || '1') === '1'; // domyślnie włączone logowanie
 const BASE = 'https://swpp2.gkpge.pl';
 const LIST_URL = BASE + '/app/demand/notice/public/current/list'
   + '?demandOrganization_orgName=000000010007&demandOrganization_withSuborgs=true';
@@ -12,26 +12,19 @@ const BOARD_ID          = process.env.BOARD_ID;
 const LIST_RZESZOW_ID   = process.env.LIST_RZESZOW_ID;
 const LIST_SKARZYSKO_ID = process.env.LIST_SKARZYSKO_ID;
 
+// --- sanity check
 for (const [k,v] of Object.entries({TRELLO_KEY,TRELLO_TOKEN,BOARD_ID,LIST_RZESZOW_ID,LIST_SKARZYSKO_ID})) {
   if (!v) { console.error('Brak zmiennej środowiskowej:', k); process.exit(1); }
 }
 
-const RESP_PATTERNS = [
-  /\/app\/demand\/notice\/public\/current\/api\/list/i,
-  /\/app\/demand\/notice\/public\/api\/notices/i,
-  /\/app\/demand\/notice\/public\/notices/i,
-  /\/api\/public\/demand\/notice\/search/i,
-  /\/api\/demand\/notice\/public\/search/i,
-  /\/api\/.*notice/i
-];
+function log(...args){ if (DEBUG) console.log(...args); }
 
-function isJsonContent(resp) {
-  const ct = (resp.headers()['content-type'] || '').toLowerCase();
-  return ct.includes('application/json') || ct.includes('json');
+function unwrapList(json){
+  if (!json) return null;
+  if (Array.isArray(json)) return json;
+  return json.content || json.items || json.data || json.results || null;
 }
-function urlLooksLikeList(u='') {
-  return RESP_PATTERNS.some(r => r.test(u));
-}
+
 function detectRegion(number='', title='') {
   const u = String(number).toUpperCase();
   const t = String(title).toLowerCase();
@@ -39,6 +32,7 @@ function detectRegion(number='', title='') {
   if (u.includes('/OSK/') || t.includes('skarż') || t.includes('skarz')) return 'Skarżysko-Kamienna';
   return '';
 }
+
 function normalizeDeadline(v) {
   if (!v) return '';
   if (/^\d{2}-\d{2}-\d{4}\s+\d{2}:\d{2}$/.test(v)) return v;
@@ -46,64 +40,133 @@ function normalizeDeadline(v) {
   if (m) return `${m[3]}-${m[2]}-${m[1]} ${m[4]}:${m[5]}`;
   return String(v);
 }
+
 function uniqBy(arr, keyFn) {
   const m = new Map();
   for (const x of arr) { const k = keyFn(x); if (!m.has(k)) m.set(k, x); }
   return [...m.values()];
 }
 
-async function captureListJson(page) {
-  let got = null;
-  const seen = new Set();
+async function getSessionHeaders(context){
+  const cookies = await context.cookies(BASE);
+  const jar = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+  const xsrf = cookies.find(c => c.name === 'XSRF-TOKEN');
+  const headers = {
+    'accept': 'application/json, text/plain, */*',
+    'content-type': 'application/json',
+    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
+    'referer': LIST_URL,
+    'origin': BASE,
+    'cookie': jar
+  };
+  if (xsrf?.value) headers['x-xsrf-token'] = decodeURIComponent(xsrf.value);
+  return headers;
+}
 
+async function tryFetchListDirect(context){
+  const headers = await getSessionHeaders(context);
+  const qs = 'demandOrganization_orgName=000000010007&demandOrganization_withSuborgs=true&page=0&size=200&sort=publicationDate,desc&onlyCurrent=true';
+  const endpoints = [
+    '/app/demand/notice/public/current/api/list',
+    '/app/demand/notice/public/api/notices',
+    '/app/demand/notice/public/notices',
+    '/app/demand/notice/public/notices/search',
+    '/api/public/demand/notice/search',
+    '/api/demand/notice/public/search'
+  ];
+
+  const bodies = [
+    { page:0, size:200, sort:['publicationDate,desc'], filters: { demandOrganization_orgName:'000000010007', demandOrganization_withSuborgs:true, onlyCurrent:true } },
+    { page:0, size:200, sort:['publicationDate,desc'], demandOrganization_orgName:'000000010007', demandOrganization_withSuborgs:true, onlyCurrent:true },
+    { page:0, size:200, query:'', search:'', filters:{ onlyCurrent:true, demandOrganization_orgName:'000000010007', demandOrganization_withSuborgs:true } },
+    { page:0, size:200 }
+  ];
+
+  // POST warianty
+  for (const ep of endpoints) {
+    for (const body of bodies) {
+      const url = BASE + ep;
+      try {
+        const res = await fetch(url, { method:'POST', headers, body: JSON.stringify(body) });
+        const txt = await res.text();
+        const ok = res.ok && txt.trim().startsWith('{') || txt.trim().startsWith('[');
+        log('[POST]', ep, res.status, ok ? 'json' : 'not-json');
+        if (!ok) continue;
+        const j = JSON.parse(txt);
+        const arr = unwrapList(j);
+        if (arr?.length) {
+          log('→ trafiony endpoint POST:', ep, 'items:', arr.length);
+          return arr;
+        }
+      } catch (e) {
+        log('[POST] err', ep, e.toString().slice(0,120));
+      }
+    }
+  }
+
+  // GET warianty
+  for (const ep of endpoints) {
+    const url = BASE + ep + (ep.includes('?') ? '&' : '?') + qs;
+    try {
+      const res = await fetch(url, { method:'GET', headers });
+      const txt = await res.text();
+      const ok = res.ok && (txt.trim().startsWith('{') || txt.trim().startsWith('['));
+      log('[GET]', ep, res.status, ok ? 'json' : 'not-json');
+      if (!ok) continue;
+      const j = JSON.parse(txt);
+      const arr = unwrapList(j);
+      if (arr?.length) {
+        log('→ trafiony endpoint GET:', ep, 'items:', arr.length);
+        return arr;
+      }
+    } catch (e) {
+      log('[GET] err', ep, e.toString().slice(0,120));
+    }
+  }
+
+  return null;
+}
+
+async function captureListJson(page, context) {
+  let got = null;
   page.on('response', async (resp) => {
     try {
       const url = resp.url();
-      if (seen.has(url)) return;
-      if (!urlLooksLikeList(url)) return;
-      if (!isJsonContent(resp)) return;
+      const ct = (resp.headers()['content-type'] || '').toLowerCase();
+      if (!ct.includes('json')) return;
+      if (!/\/app\/demand\/notice\/public\//.test(url) && !/\/api\//.test(url)) return;
       const json = await resp.json().catch(()=>null);
-      if (!json) return;
-      const arr = Array.isArray(json) ? json : (json.content || json.items || json.data || json.results || []);
-      if (Array.isArray(arr) && arr.length) {
+      const arr = unwrapList(json);
+      if (arr?.length) {
         got = arr;
-        seen.add(url);
-        if (DEBUG) console.log('[capture:onResponse] JSON z', url, '→', arr.length);
-      }
-    } catch (e) {}
-  });
-
-  await page.goto(LIST_URL, { waitUntil: 'domcontentloaded' });
-  await page.waitForLoadState('networkidle').catch(()=>{});
-
-  // 1) Spróbuj poczekać aż pojawi się któryś z JSON‑ów
-  const resp = await page.waitForResponse(r => urlLooksLikeList(r.url()) && isJsonContent(r), { timeout: 15000 }).catch(() => null);
-  if (resp) {
-    try {
-      const j = await resp.json();
-      const arr = Array.isArray(j) ? j : (j.content || j.items || j.data || j.results || []);
-      if (Array.isArray(arr) && arr.length) {
-        got = arr;
-        if (DEBUG) console.log('[capture:waitForResponse] JSON z', resp.url(), '→', arr.length);
+        log('[onResponse] JSON z', url, '→', arr.length);
       }
     } catch {}
+  });
+
+  log('→ Nawigacja do LIST_URL…');
+  await page.goto(LIST_URL, { waitUntil: 'domcontentloaded' });
+  await page.waitForLoadState('networkidle').catch(()=>{});
+  // krótka pauza na XHR-y
+  await page.waitForTimeout(1500);
+
+  // Spróbuj bezpośrednich wywołań, używając nagłówków z sesji
+  if (!got) {
+    log('→ Próba bezpośrednich wywołań JSON (POST/GET) z nagłówkami sesji)…');
+    got = await tryFetchListDirect(context);
   }
 
-  // 2) Fallback: zrób fetch z wnętrza strony (ma ciasteczka + XSRF)
+  // Ostatnia próba: fetch w kontekście strony
   if (!got) {
-    if (DEBUG) console.log('[capture:fallback] Próbuję fetch w kontekście strony (POST i GET, różne endpoints)…');
+    log('→ Fallback: fetch() wewnątrz strony z XSRF/cookie…');
     got = await page.evaluate(async () => {
-      function unwrap(j){
-        if (!j) return null;
-        if (Array.isArray(j)) return j;
-        return j.content || j.items || j.data || j.results || null;
-      }
+      function unwrap(j){ if (!j) return null; if (Array.isArray(j)) return j; return j.content || j.items || j.data || j.results || null; }
       const qs = '?demandOrganization_orgName=000000010007&demandOrganization_withSuborgs=true&page=0&size=200&sort=publicationDate,desc&onlyCurrent=true';
       const endpoints = [
         '/app/demand/notice/public/current/api/list',
         '/app/demand/notice/public/api/notices',
         '/app/demand/notice/public/notices',
-        '/api/public/demand/notice/search'
+        '/app/demand/notice/public/notices/search'
       ];
       const xsrf = decodeURIComponent((document.cookie.split('; ').find(s=>s.startsWith('XSRF-TOKEN='))||'').split('=')[1]||'');
       const headers = xsrf ? { 'content-type': 'application/json', 'x-xsrf-token': xsrf } : { 'content-type': 'application/json' };
@@ -112,7 +175,6 @@ async function captureListJson(page) {
         { page:0, size:200, sort:['publicationDate,desc'], demandOrganization_orgName:'000000010007', demandOrganization_withSuborgs:true, onlyCurrent:true },
         { page:0, size:200, query:'', search:'', filters:{ onlyCurrent:true, demandOrganization_orgName:'000000010007', demandOrganization_withSuborgs:true } }
       ];
-      // POST warianty
       for (const ep of endpoints) {
         for (const b of bodies) {
           try {
@@ -120,19 +182,18 @@ async function captureListJson(page) {
             if (r.ok) {
               const j = await r.json().catch(()=>null);
               const arr = unwrap(j);
-              if (arr && arr.length) return arr;
+              if (arr?.length) return arr;
             }
           } catch {}
         }
       }
-      // GET warianty
       for (const ep of endpoints) {
         try {
           const r = await fetch(ep + qs, { method:'GET', credentials:'same-origin', headers: { 'accept':'application/json' } });
           if (r.ok) {
             const j = await r.json().catch(()=>null);
             const arr = unwrap(j);
-            if (arr && arr.length) return arr;
+            if (arr?.length) return arr;
           }
         } catch {}
       }
@@ -140,9 +201,7 @@ async function captureListJson(page) {
     });
   }
 
-  if (!got) return [];
-  // Usuń duplikaty i zwróć
-  return uniqBy(got, it => String(it.id || it.noticeId || it.noticeID || it.demandNoticeId || it.demandId || '') + '|' + String(it.noticeNumber || it.number || it.code || ''));
+  return got || [];
 }
 
 async function trelloGetExistingNumbers() {
@@ -172,6 +231,7 @@ async function trelloCreateCard(t) {
 }
 
 async function main() {
+  console.log('▶︎ Runner start (Playwright v3)…');
   const browser = await chromium.launch({ headless: true });
   const context = await browser.newContext({
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
@@ -179,22 +239,21 @@ async function main() {
   });
   const page = await context.newPage();
 
-  const items = await captureListJson(page);
+  const items = await captureListJson(page, context);
   await browser.close();
 
   if (!items.length) {
-    console.log('Nie przechwycono JSON-a listy – dodaję tryb rozszerzony logowania (włącz DEBUG=1).');
+    console.log('⛔ Nie przechwycono JSON-a listy – możliwa zmiana endpointu po stronie PGE.');
+    console.log('   Włącz DEBUG=1 dla rozszerzonych logów (Actions → Run workflow → Variables).');
     process.exit(0);
   }
 
-  if (DEBUG) {
-    const sample = items.slice(0, 3).map(it => ({
-      id: it.id || it.noticeId || it.noticeID || it.demandNoticeId || it.demandId,
-      number: it.noticeNumber || it.number || it.code,
-      title: it.title || it.subject || it.name
-    }));
-    console.log('[debug] Próbka JSON:', sample);
-  }
+  const sample = items.slice(0, 3).map(it => ({
+    id: it.id || it.noticeId || it.noticeID || it.demandNoticeId || it.demandId,
+    number: it.noticeNumber || it.number || it.code,
+    title: it.title || it.subject || it.name
+  }));
+  log('[sample]', sample);
 
   const tenders = items.map(it => {
     const id = it.id || it.noticeId || it.noticeID || it.demandNoticeId || it.demandId;
@@ -206,22 +265,23 @@ async function main() {
     return { id, number, title, deadline, region, url };
   }).filter(t => t.number && t.region);
 
-  console.log(`Pobrano ${tenders.length} rekordów (po filtrowaniu OR/OSK).`);
+  console.log(`✅ Pobrano ${tenders.length} rekordów (po filtrowaniu OR/OSK).`);
 
   const existing = await trelloGetExistingNumbers();
   const fresh = tenders.filter(t => !existing.has(t.number.toUpperCase()));
 
-  console.log(`Do utworzenia: ${fresh.length}`);
+  console.log(`🆕 Do utworzenia: ${fresh.length}`);
 
   for (const t of fresh) {
     try {
       await trelloCreateCard(t);
-      console.log('Dodano:', t.number);
+      console.log('➕ Dodano:', t.number);
       await new Promise(r => setTimeout(r, 400));
     } catch (e) {
       console.error('Błąd dodawania', t.number, e);
     }
   }
+  console.log('🏁 Zakończono.');
 }
 
-main().catch(err => { console.error(err); process.exit(1); });
+main().catch(err => { console.error('Fatal:', err); process.exit(1); });
